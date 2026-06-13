@@ -63,6 +63,7 @@ struct MeasureGroup     // Lidar data and imu dates for the curent process
     double lidar_end_time;
     PointCloudXYZI::Ptr lidar;
     deque<sensor_msgs::Imu::ConstPtr> imu;
+    deque<nav_msgs::Odometry::ConstPtr> gps;
 };
 
 struct StatesGroup

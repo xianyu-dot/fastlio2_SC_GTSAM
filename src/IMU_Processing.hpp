@@ -27,7 +27,7 @@
 
 /// *************Preconfiguration
 
-#define MAX_INI_COUNT (10)
+#define MAX_INI_COUNT (50)
 
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
 
@@ -45,6 +45,7 @@ class ImuProcess
   void set_extrinsic(const V3D &transl, const M3D &rot);
   void set_extrinsic(const V3D &transl);
   void set_extrinsic(const MD(4,4) &T);
+  void set_gps_extrinsic(const V3D &transl);
   void set_gyr_cov(const V3D &scaler);
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
@@ -73,6 +74,7 @@ class ImuProcess
   vector<M3D>    v_rot_pcl_;
   M3D Lidar_R_wrt_IMU;
   V3D Lidar_T_wrt_IMU;
+  V3D GPS_T_wrt_IMU;
   V3D mean_acc;
   V3D mean_gyr;
   V3D angvel_last;
@@ -98,6 +100,7 @@ ImuProcess::ImuProcess()
   angvel_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
+  GPS_T_wrt_IMU   = Zero3d;
   last_imu_.reset(new sensor_msgs::Imu());
 }
 
@@ -134,6 +137,11 @@ void ImuProcess::set_extrinsic(const V3D &transl, const M3D &rot)
 {
   Lidar_T_wrt_IMU = transl;
   Lidar_R_wrt_IMU = rot;
+}
+
+void ImuProcess::set_gps_extrinsic(const V3D &transl)
+{
+  GPS_T_wrt_IMU = transl;
 }
 
 void ImuProcess::set_gyr_cov(const V3D &scaler)
@@ -188,14 +196,43 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     cov_acc = cov_acc * (N - 1.0) / N + (cur_acc - mean_acc).cwiseProduct(cur_acc - mean_acc) * (N - 1.0) / (N * N);
     cov_gyr = cov_gyr * (N - 1.0) / N + (cur_gyr - mean_gyr).cwiseProduct(cur_gyr - mean_gyr) * (N - 1.0) / (N * N);
 
-    // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
-
     N ++;
   }
   state_ikfom init_state = kf_state.get_x();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
   
-  //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
+  // Gravity alignment for initial rotation (maps mean_acc to [0, 0, G])
+  M3D R_i_w = Eigen::Quaterniond::FromTwoVectors(mean_acc, V3D(0, 0, G_m_s2)).toRotationMatrix();
+  
+  // Initialize Position and Heading from GPS if available
+  if (!meas.gps.empty())
+  {
+    auto last_gps = meas.gps.back();
+    V3D pos_rtk(last_gps->pose.pose.position.x, last_gps->pose.pose.position.y, last_gps->pose.pose.position.z);
+    
+    // Align yaw with GPS heading if available
+    Eigen::Quaterniond q_gps(last_gps->pose.pose.orientation.w, 
+                             last_gps->pose.pose.orientation.x, 
+                             last_gps->pose.pose.orientation.y, 
+                             last_gps->pose.pose.orientation.z);
+    
+    if (q_gps.coeffs().norm() > 0.1)
+    {
+        double yaw_gps = RotMtoEuler(q_gps.toRotationMatrix())(2);
+        double yaw_i_w = RotMtoEuler(R_i_w)(2);
+        // Rotate R_i_w around world Z axis to match GPS yaw
+        R_i_w = Eigen::AngleAxisd(yaw_gps - yaw_i_w, V3D(0, 0, 1)).toRotationMatrix() * R_i_w;
+    }
+
+    init_state.rot = R_i_w;
+    init_state.pos = Zero3d; // Always start at zero to align origins
+  }
+  else
+  {
+    init_state.rot = R_i_w;
+    init_state.pos = Zero3d;
+  }
+  
+  init_state.grav = S2(0, 0, -G_m_s2);
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
@@ -203,6 +240,10 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
 
   esekfom::esekf<state_ikfom, 12, input_ikfom>::cov init_P = kf_state.get_P();
   init_P.setIdentity();
+  if (!meas.gps.empty())
+  {
+    init_P(0,0) = init_P(1,1) = init_P(2,2) = 0.0001;
+  }
   init_P(6,6) = init_P(7,7) = init_P(8,8) = 0.00001;
   init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;
   init_P(15,15) = init_P(16,16) = init_P(17,17) = 0.0001;
@@ -210,7 +251,6 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(21,21) = init_P(22,22) = 0.00001; 
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
-
 }
 
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_out)
@@ -371,8 +411,16 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
       cov_acc = cov_acc_scale;
       cov_gyr = cov_gyr_scale;
       ROS_INFO("IMU Initial Done");
-      // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
-      //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
+      
+      // Print Alignment Results
+      state_ikfom s = kf_state.get_x();
+      V3D euler = SO3ToEuler(s.rot);
+      ROS_INFO("Gravity alignment: initial gravity in IMU frame: [%.4f, %.4f, %.4f]", 
+               mean_acc(0), mean_acc(1), mean_acc(2));
+      ROS_INFO("Alignment Result (Euler angles in deg): Roll: %.3f, Pitch: %.3f, Yaw: %.3f", 
+               euler(0), euler(1), euler(2));
+      ROS_INFO("Initial Position: [%.3f, %.3f, %.3f]", s.pos(0), s.pos(1), s.pos(2));
+      
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
     }
 

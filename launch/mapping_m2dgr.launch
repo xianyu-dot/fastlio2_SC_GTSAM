@@ -1,0 +1,92 @@
+<launch>
+    <!-- 1. 播放 Bag 时必须开启仿真时间 -->
+    <param name="/use_sim_time" value="false" />
+
+    <arg name="rviz" default="true" />
+
+    <!-- 2. 加载 FAST-LIO2 参数 -->
+    <rosparam command="load" file="$(find fast_lio)/config/m2dgr.yaml" />
+
+    <!-- FAST-LIO2 Mapping Node -->
+    <param name="feature_extract_enable" type="bool" value="0"/>
+    <param name="point_filter_num" type="int" value="2"/>
+    <param name="max_iteration" type="int" value="3" />
+    <param name="filter_size_surf" type="double" value="0.4" />
+    <param name="filter_size_map" type="double" value="0.4" />
+    <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen" /> 
+
+    <!-- 3. TF 桥接：建立 camera_init -> body -> base_link 链路 -->
+    <node pkg="tf" type="static_transform_publisher" name="body_to_base_link" args="0 0 0 0 0 0 body base_link 100" />
+    <node pkg="tf" type="static_transform_publisher" name="base_link_to_gps" args="0 0 0 0 0 0 base_link ublox 100" />
+    <node pkg="tf" type="static_transform_publisher" name="base_link_to_imu" args="0 0 0 0 0 0 base_link handsfree 100" />
+
+    <!-- 4. Navsat Transform Node: 严格参照 LIO-SAM 配置 -->
+    <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform_node" output="screen">
+        <param name="frequency" value="50" />
+        <param name="wait_for_datum" value="false" />
+        <param name="delay" value="0.0" />
+        <param name="magnetic_declination_radians" value="0" />
+        <param name="yaw_offset" value="0" />
+        <param name="zero_altitude" value="true" />
+        <param name="broadcast_utm_transform" value="false" />
+        <param name="broadcast_utm_transform_as_parent_frame" value="false" />
+        <param name="publish_filtered_gps" value="false" />
+        
+        <param name="map_frame" value="map" />
+        <param name="odom_frame" value="camera_init" />
+        <param name="base_link_frame" value="base_link" />
+
+        <remap from="/gps/fix" to="/ublox/fix" />
+        <remap from="/imu/data" to="/handsfree/imu" />
+        <remap from="/odometry/gps" to="/odometry/gps_raw" />
+    </node>
+
+    <!-- 5. EKF Node: 融合 IMU 与 GPS -->
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_gps" output="screen">
+        <param name="publish_tf" value="false" />
+        <param name="map_frame" value="map" />
+        <param name="odom_frame" value="camera_init" />
+        <param name="base_link_frame" value="base_link" />
+        <param name="world_frame" value="camera_init" />
+
+        <param name="frequency" value="50" />
+        <param name="two_d_mode" value="true" />
+        <param name="sensor_timeout" value="0.1" />
+
+        <param name="imu0" value="/handsfree/imu" />
+        <rosparam param="imu0_config">[false, false, false,
+                                       true,  true,  true,
+                                       false, false, false,
+                                       false, false, true,
+                                       true,  true,  true]</rosparam>
+
+        <param name="odom0" value="/odometry/gps_raw" />
+        <rosparam param="odom0_config">[true,  true,  true,
+                                        false, false, false,
+                                        false, false, false,
+                                        false, false, false,
+                                        false, false, false]</rosparam>
+
+        <rosparam param="process_noise_covariance">[1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                    0, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 10.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0.03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0.03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0.1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0.25, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0.25, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0.04, 0, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0.01, 0, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.01, 0, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.5, 0, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.01, 0, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.01, 0,
+                                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.015]</rosparam>
+        
+        <remap from="odometry/filtered" to="odometry/gps_ekf" />
+    </node>
+
+    <group if="$(arg rviz)">
+        <node pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_lio)/rviz_cfg/loam_livox.rviz" />
+    </group>
+</launch>
